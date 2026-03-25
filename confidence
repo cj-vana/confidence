@@ -10,8 +10,8 @@ set -euo pipefail
 VERSION="1.0.0"
 
 # ── defaults ─────────────────────────────────────────────────────────
-CLAUDE_MODEL=""          # use default (opus)
-CODEX_MODEL=""           # use default (o3)
+CLAUDE_MODEL="opus"      # best Claude model
+CODEX_MODEL="o3"         # best OpenAI reasoning model
 CONFIDENCE_TIMEOUT=90    # seconds for confidence phase
 EXECUTE_TIMEOUT=300      # seconds for execution phase
 VERBOSE=false
@@ -56,8 +56,8 @@ ${BOLD}OPTIONS${RESET}
     -v, --verbose           Verbose output
     -n, --dry-run           Show confidence scores but don't execute
     -s, --scores            Show confidence scores before executing
-    --claude-model <model>  Override Claude model (default: opus)
-    --codex-model <model>   Override Codex model (default: o3)
+    --claude-model <model>  Claude model (default: opus)
+    --codex-model <model>   Codex model (default: o3)
     --force <claude|codex>  Skip confidence check, use this model
     --timeout <seconds>     Execution timeout (default: 300)
     -C, --cd <dir>          Working directory for execution

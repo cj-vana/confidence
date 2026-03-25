@@ -79,8 +79,8 @@ echo "prompt" | confidence [options]
 | `-n, --dry-run` | Show confidence scores but don't execute |
 | `-s, --scores` | Show confidence scores before executing |
 | `--force <claude\|codex>` | Skip confidence check, use this model directly |
-| `--claude-model <model>` | Override Claude model (default: opus) |
-| `--codex-model <model>` | Override Codex model (default: o3) |
+| `--claude-model <model>` | Claude model (default: opus) |
+| `--codex-model <model>` | Codex/OpenAI model (default: o3) |
 | `--timeout <seconds>` | Execution timeout (default: 300) |
 | `-C, --cd <dir>` | Working directory for execution |
 | `--yolo` | Run Codex without sandbox restrictions |
