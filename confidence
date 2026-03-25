@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── confidence ───────────────────────────────────────────────────────
+# Routes a prompt to whichever AI model is most confident it can solve it.
+# Runs Claude Code and Codex CLI in parallel for confidence assessment,
+# then executes with the winner.
+# ─────────────────────────────────────────────────────────────────────
+
+VERSION="1.0.0"
+
+# ── defaults ─────────────────────────────────────────────────────────
+CLAUDE_MODEL=""          # use default (opus)
+CODEX_MODEL=""           # use default (o3)
+CONFIDENCE_TIMEOUT=90    # seconds for confidence phase
+EXECUTE_TIMEOUT=300      # seconds for execution phase
+VERBOSE=false
+DRY_RUN=false
+FORCE_MODEL=""           # skip confidence, go straight to this model
+SHOW_SCORES=false
+WORKING_DIR="$(pwd)"
+CODEX_APPROVAL="--full-auto"
+
+# ── colors (stderr only) ────────────────────────────────────────────
+if [[ -t 2 ]]; then
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    CYAN='\033[36m'
+    GREEN='\033[32m'
+    YELLOW='\033[33m'
+    RED='\033[31m'
+    MAGENTA='\033[35m'
+    RESET='\033[0m'
+else
+    BOLD='' DIM='' CYAN='' GREEN='' YELLOW='' RED='' MAGENTA='' RESET=''
+fi
+
+# ── helpers ──────────────────────────────────────────────────────────
+log()   { echo -e "${DIM}[confidence]${RESET} $*" >&2; }
+info()  { echo -e "${CYAN}${BOLD}▸${RESET} $*" >&2; }
+ok()    { echo -e "${GREEN}${BOLD}✓${RESET} $*" >&2; }
+warn()  { echo -e "${YELLOW}${BOLD}⚠${RESET} $*" >&2; }
+err()   { echo -e "${RED}${BOLD}✗${RESET} $*" >&2; }
+debug() { $VERBOSE && log "$@" || true; }
+
+usage() {
+    cat >&2 <<EOF
+${BOLD}confidence${RESET} v${VERSION} — route prompts to the most confident model
+
+${BOLD}USAGE${RESET}
+    confidence [options] <prompt>
+    echo "prompt" | confidence [options]
+
+${BOLD}OPTIONS${RESET}
+    -h, --help              Show this help
+    -v, --verbose           Verbose output
+    -n, --dry-run           Show confidence scores but don't execute
+    -s, --scores            Show confidence scores before executing
+    --claude-model <model>  Override Claude model (default: opus)
+    --codex-model <model>   Override Codex model (default: o3)
+    --force <claude|codex>  Skip confidence check, use this model
+    --timeout <seconds>     Execution timeout (default: 300)
+    -C, --cd <dir>          Working directory for execution
+    --yolo                  Run Codex without sandbox restrictions
+
+${BOLD}EXAMPLES${RESET}
+    confidence "refactor auth.py to use async/await"
+    confidence --scores "write unit tests for the API layer"
+    confidence --force claude "explain this codebase"
+    echo "fix the flaky test in ci.yml" | confidence
+    confidence --yolo "set up the project scaffold"
+EOF
+    exit 0
+}
+
+# ── arg parsing ──────────────────────────────────────────────────────
+PROMPT=""
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)        usage ;;
+        -v|--verbose)     VERBOSE=true; shift ;;
+        -n|--dry-run)     DRY_RUN=true; SHOW_SCORES=true; shift ;;
+        -s|--scores)      SHOW_SCORES=true; shift ;;
+        --claude-model)   CLAUDE_MODEL="$2"; shift 2 ;;
+        --codex-model)    CODEX_MODEL="$2"; shift 2 ;;
+        --force)          FORCE_MODEL="$2"; shift 2 ;;
+        --timeout)        EXECUTE_TIMEOUT="$2"; shift 2 ;;
+        -C|--cd)          WORKING_DIR="$2"; shift 2 ;;
+        --yolo)           CODEX_APPROVAL="--dangerously-bypass-approvals-and-sandbox"; shift ;;
+        --)               shift; POSITIONAL+=("$@"); break ;;
+        -*)               err "Unknown option: $1"; usage ;;
+        *)                POSITIONAL+=("$1"); shift ;;
+    esac
+done
+
+# reassemble prompt from positional args or stdin
+if [[ ${#POSITIONAL[@]} -gt 0 ]]; then
+    PROMPT="${POSITIONAL[*]}"
+elif [[ ! -t 0 ]]; then
+    PROMPT="$(cat)"
+fi
+
+if [[ -z "$PROMPT" ]]; then
+    err "No prompt provided"
+    usage
+fi
+
+# ── dependency checks ────────────────────────────────────────────────
+for cmd in claude codex jq; do
+    if ! command -v "$cmd" &>/dev/null; then
+        err "Required command not found: $cmd"
+        exit 1
+    fi
+done
+
+# ── temp directory ───────────────────────────────────────────────────
+TMPDIR_CONF="$(mktemp -d /tmp/confidence-XXXXXX)"
+cleanup() { rm -rf "$TMPDIR_CONF" 2>/dev/null; }
+trap cleanup EXIT
+
+# ── confidence schema ────────────────────────────────────────────────
+SCHEMA_FILE="${TMPDIR_CONF}/schema.json"
+cat > "$SCHEMA_FILE" <<'SCHEMA'
+{"type":"object","properties":{"confidence":{"type":"integer","minimum":0,"maximum":100,"description":"Confidence score 0-100 that you can complete this task correctly and completely"},"reasoning":{"type":"string","description":"Brief explanation of your confidence level"},"approach":{"type":"string","description":"High-level approach you would take"},"strengths":{"type":"array","items":{"type":"string"},"description":"What makes you well-suited for this task"},"risks":{"type":"array","items":{"type":"string"},"description":"Potential challenges or weaknesses for this task"},"estimated_complexity":{"type":"string","enum":["trivial","simple","moderate","complex","very_complex"],"description":"Estimated task complexity"}},"required":["confidence","reasoning","approach","strengths","risks","estimated_complexity"],"additionalProperties":false}
+SCHEMA
+SCHEMA_JSON="$(cat "$SCHEMA_FILE")"
+
+# ── write prompts to files (avoids pipe/background issues) ───────────
+PROMPT_FILE="${TMPDIR_CONF}/prompt.txt"
+echo "$PROMPT" > "$PROMPT_FILE"
+
+META_FILE="${TMPDIR_CONF}/meta_prompt.txt"
+cat > "$META_FILE" <<METAPROMPT
+You are evaluating whether you are the best model to handle a task. Be HONEST about your confidence — do not inflate your score. Consider:
+
+- Your actual capabilities and known limitations
+- Whether the task plays to your strengths (reasoning, code generation, debugging, creative writing, etc.)
+- The complexity and risk of getting it wrong
+- Whether you'd need tools/context you might not have
+
+Rate your confidence 0-100 where:
+  0-20:  Very unlikely to succeed or produce quality output
+  21-40: Might succeed but significant gaps expected
+  41-60: Decent chance but notable uncertainty
+  61-80: Confident, likely good result with minor gaps
+  81-95: Very confident, strong match for my capabilities
+  96-100: Near-certain, this is exactly what I'm built for
+
+THE TASK:
+${PROMPT}
+METAPROMPT
+
+FAIL_JSON='{"confidence":0,"reasoning":"Failed to get response","approach":"n/a","strengths":[],"risks":["timeout or error"],"estimated_complexity":"complex"}'
+
+# ── run confidence assessments ───────────────────────────────────────
+run_claude_confidence() {
+    local outfile="${TMPDIR_CONF}/claude_raw.json"
+    local result_file="$1"
+    local claude_args=(-p --output-format json --json-schema "$SCHEMA_JSON")
+    [[ -n "$CLAUDE_MODEL" ]] && claude_args+=(--model "$CLAUDE_MODEL")
+
+    debug "Running Claude confidence check..."
+    if claude "${claude_args[@]}" < "$META_FILE" > "$outfile" 2>/dev/null; then
+        local structured
+        structured="$(jq -r '.structured_output // empty' "$outfile" 2>/dev/null)"
+        if [[ -n "$structured" ]] && echo "$structured" | jq -e '.confidence' &>/dev/null; then
+            echo "$structured" > "$result_file"
+            return 0
+        fi
+    fi
+    debug "Claude confidence check failed"
+    echo "$FAIL_JSON" > "$result_file"
+}
+
+run_codex_confidence() {
+    local outfile="${TMPDIR_CONF}/codex_raw.json"
+    local result_file="$1"
+    local codex_args=(exec --full-auto --skip-git-repo-check --ephemeral --output-schema "$SCHEMA_FILE" -o "$outfile")
+    [[ -n "$CODEX_MODEL" ]] && codex_args+=(-m "$CODEX_MODEL")
+
+    debug "Running Codex confidence check..."
+    if codex "${codex_args[@]}" "$(cat "$META_FILE")" &>/dev/null; then
+        if [[ -f "$outfile" ]] && jq -e '.confidence' "$outfile" &>/dev/null; then
+            jq '.' "$outfile" > "$result_file"
+            return 0
+        fi
+    fi
+    debug "Codex confidence check failed"
+    echo "$FAIL_JSON" > "$result_file"
+}
+
+# ── display confidence results ───────────────────────────────────────
+show_confidence() {
+    local label="$1" color="$2" json="$3"
+    local score reasoning approach complexity
+
+    score="$(echo "$json" | jq -r '.confidence')"
+    reasoning="$(echo "$json" | jq -r '.reasoning')"
+    approach="$(echo "$json" | jq -r '.approach')"
+    complexity="$(echo "$json" | jq -r '.estimated_complexity')"
+
+    # color the score
+    local score_color="$RED"
+    if (( score >= 80 )); then score_color="$GREEN"
+    elif (( score >= 60 )); then score_color="$CYAN"
+    elif (( score >= 40 )); then score_color="$YELLOW"
+    fi
+
+    echo -e "" >&2
+    echo -e "  ${color}${BOLD}${label}${RESET}  ${score_color}${BOLD}${score}/100${RESET}  ${DIM}(${complexity})${RESET}" >&2
+    echo -e "  ${DIM}Reasoning:${RESET} ${reasoning}" >&2
+    echo -e "  ${DIM}Approach:${RESET}  ${approach}" >&2
+
+    if $VERBOSE; then
+        echo -e "  ${DIM}Strengths:${RESET}" >&2
+        echo "$json" | jq -r '.strengths[]' 2>/dev/null | while read -r s; do
+            echo -e "    ${GREEN}+${RESET} $s" >&2
+        done
+        echo -e "  ${DIM}Risks:${RESET}" >&2
+        echo "$json" | jq -r '.risks[]' 2>/dev/null | while read -r r; do
+            echo -e "    ${RED}-${RESET} $r" >&2
+        done
+    fi
+}
+
+# ── execute with chosen model ────────────────────────────────────────
+execute_claude() {
+    info "Executing with ${MAGENTA}Claude${RESET}..."
+    local args=(-p --permission-mode bypassPermissions --add-dir "$WORKING_DIR")
+    [[ -n "$CLAUDE_MODEL" ]] && args+=(--model "$CLAUDE_MODEL")
+
+    claude "${args[@]}" < "$PROMPT_FILE" 2>/dev/null
+}
+
+execute_codex() {
+    info "Executing with ${MAGENTA}Codex${RESET}..."
+    local outfile="${TMPDIR_CONF}/exec_result.txt"
+    local args=(exec $CODEX_APPROVAL --skip-git-repo-check -C "$WORKING_DIR" -o "$outfile")
+    [[ -n "$CODEX_MODEL" ]] && args+=(-m "$CODEX_MODEL")
+
+    codex "${args[@]}" "$(cat "$PROMPT_FILE")" >/dev/null 2>&1
+    [[ -f "$outfile" ]] && cat "$outfile"
+}
+
+# ── main ─────────────────────────────────────────────────────────────
+main() {
+    echo -e "${BOLD}confidence${RESET} v${VERSION}" >&2
+    echo -e "${DIM}Prompt: ${PROMPT:0:80}${RESET}$( (( ${#PROMPT} > 80 )) && echo '...' )" >&2
+
+    # forced model — skip confidence phase
+    if [[ -n "$FORCE_MODEL" ]]; then
+        info "Forced model: ${BOLD}${FORCE_MODEL}${RESET}"
+        case "$FORCE_MODEL" in
+            claude) execute_claude ;;
+            codex)  execute_codex ;;
+            *)      err "Unknown model: $FORCE_MODEL (use 'claude' or 'codex')"; exit 1 ;;
+        esac
+        return
+    fi
+
+    # run confidence checks in parallel
+    info "Assessing confidence..."
+
+    local claude_result="${TMPDIR_CONF}/claude_result.json"
+    local codex_result="${TMPDIR_CONF}/codex_result.json"
+
+    # initialize with fail json in case background jobs don't write
+    echo "$FAIL_JSON" > "$claude_result"
+    echo "$FAIL_JSON" > "$codex_result"
+
+    run_claude_confidence "$claude_result" &
+    local claude_pid=$!
+    run_codex_confidence "$codex_result" &
+    local codex_pid=$!
+
+    # wait for both with individual timeouts via watchdog
+    (
+        sleep "$CONFIDENCE_TIMEOUT"
+        kill "$claude_pid" 2>/dev/null
+        kill "$codex_pid" 2>/dev/null
+    ) &
+    local watchdog_pid=$!
+
+    wait "$claude_pid" 2>/dev/null || true
+    wait "$codex_pid" 2>/dev/null || true
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
+
+    local claude_json codex_json
+    claude_json="$(cat "$claude_result")"
+    codex_json="$(cat "$codex_result")"
+
+    # parse scores
+    local claude_score codex_score
+    claude_score="$(echo "$claude_json" | jq -r '.confidence // 0')"
+    codex_score="$(echo "$codex_json" | jq -r '.confidence // 0')"
+
+    # always show scores (they're the whole point)
+    show_confidence "Claude" "$MAGENTA" "$claude_json"
+    show_confidence "Codex " "$CYAN" "$codex_json"
+
+    # pick winner
+    local winner
+    if (( claude_score > codex_score )); then
+        winner="claude"
+    elif (( codex_score > claude_score )); then
+        winner="codex"
+    else
+        # tie — prefer Claude for reasoning tasks
+        winner="claude"
+        debug "Tie at ${claude_score} — defaulting to Claude"
+    fi
+
+    local winner_score
+    if (( claude_score >= codex_score )); then
+        winner_score="$claude_score"
+    else
+        winner_score="$codex_score"
+    fi
+
+    echo -e "" >&2
+    ok "Winner: ${BOLD}${winner}${RESET} (${winner_score}/100)"
+
+    # warn on low confidence
+    if (( winner_score < 40 )); then
+        warn "Both models have low confidence. Results may be unreliable."
+    fi
+
+    # dry run — stop here
+    if $DRY_RUN; then
+        echo -e "" >&2
+        echo -e "${DIM}Dry run — skipping execution${RESET}" >&2
+
+        # output machine-readable result to stdout
+        jq -n \
+            --arg winner "$winner" \
+            --argjson claude_score "$claude_score" \
+            --argjson codex_score "$codex_score" \
+            --argjson claude "$claude_json" \
+            --argjson codex "$codex_json" \
+            '{winner: $winner, scores: {claude: $claude_score, codex: $codex_score}, claude: $claude, codex: $codex}'
+        return
+    fi
+
+    echo -e "" >&2
+
+    # execute with the winner
+    case "$winner" in
+        claude) execute_claude ;;
+        codex)  execute_codex ;;
+    esac
+}
+
+main
