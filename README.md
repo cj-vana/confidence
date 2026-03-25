@@ -80,7 +80,7 @@ echo "prompt" | confidence [options]
 | `-s, --scores` | Show confidence scores before executing |
 | `--force <claude\|codex>` | Skip confidence check, use this model directly |
 | `--claude-model <model>` | Claude model (default: opus) |
-| `--codex-model <model>` | Codex/OpenAI model (default: o3) |
+| `--codex-model <model>` | Codex/OpenAI model (default: gpt-5.4) |
 | `--timeout <seconds>` | Execution timeout (default: 300) |
 | `-C, --cd <dir>` | Working directory for execution |
 | `--yolo` | Run Codex without sandbox restrictions |
@@ -111,7 +111,7 @@ result=$(confidence "what is the capital of France")
 confidence --dry-run "complex task" | jq '.winner'
 
 # Override models
-confidence --claude-model sonnet --codex-model o4-mini "quick lint fix"
+confidence --claude-model sonnet --codex-model gpt-5.3 "quick lint fix"
 
 # Run Codex without sandbox
 confidence --yolo "set up the entire project from scratch"
