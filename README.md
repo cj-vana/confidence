@@ -83,7 +83,6 @@ echo "prompt" | confidence [options]
 | `--codex-model <model>` | Override Codex model (uses CLI default) |
 | `--timeout <seconds>` | Execution timeout (default: 300) |
 | `-C, --cd <dir>` | Working directory for execution |
-| `--yolo` | Run Codex without sandbox restrictions |
 
 ### Examples
 
@@ -113,8 +112,6 @@ confidence --dry-run "complex task" | jq '.winner'
 # Override models
 confidence --claude-model sonnet --codex-model gpt-5.3 "quick lint fix"
 
-# Run Codex without sandbox
-confidence --yolo "set up the entire project from scratch"
 ```
 
 ### Confidence scale

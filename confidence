@@ -19,7 +19,6 @@ DRY_RUN=false
 FORCE_MODEL=""           # skip confidence, go straight to this model
 SHOW_SCORES=false
 WORKING_DIR="$(pwd)"
-CODEX_APPROVAL="--full-auto"
 
 # ── colors (stderr only) ────────────────────────────────────────────
 if [[ -t 2 ]]; then
@@ -61,7 +60,6 @@ ${BOLD}OPTIONS${RESET}
     --force <claude|codex>  Skip confidence check, use this model
     --timeout <seconds>     Execution timeout (default: 300)
     -C, --cd <dir>          Working directory for execution
-    --yolo                  Run Codex without sandbox restrictions
 
 ${BOLD}EXAMPLES${RESET}
     confidence "refactor auth.py to use async/await"
@@ -88,7 +86,6 @@ while [[ $# -gt 0 ]]; do
         --force)          FORCE_MODEL="$2"; shift 2 ;;
         --timeout)        EXECUTE_TIMEOUT="$2"; shift 2 ;;
         -C|--cd)          WORKING_DIR="$2"; shift 2 ;;
-        --yolo)           CODEX_APPROVAL="--dangerously-bypass-approvals-and-sandbox"; shift ;;
         --)               shift; POSITIONAL+=("$@"); break ;;
         -*)               err "Unknown option: $1"; usage ;;
         *)                POSITIONAL+=("$1"); shift ;;
@@ -228,7 +225,7 @@ show_confidence() {
 # ── execute with chosen model ────────────────────────────────────────
 execute_claude() {
     info "Executing with ${MAGENTA}Claude${RESET}..."
-    local args=(-p --permission-mode bypassPermissions --add-dir "$WORKING_DIR")
+    local args=(-p --dangerously-skip-permissions --add-dir "$WORKING_DIR")
     [[ -n "$CLAUDE_MODEL" ]] && args+=(--model "$CLAUDE_MODEL")
 
     claude "${args[@]}" < "$PROMPT_FILE" 2>/dev/null
@@ -237,7 +234,7 @@ execute_claude() {
 execute_codex() {
     info "Executing with ${MAGENTA}Codex${RESET}..."
     local outfile="${TMPDIR_CONF}/exec_result.txt"
-    local args=(exec $CODEX_APPROVAL --skip-git-repo-check -C "$WORKING_DIR" -o "$outfile")
+    local args=(exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C "$WORKING_DIR" -o "$outfile")
     [[ -n "$CODEX_MODEL" ]] && args+=(-m "$CODEX_MODEL")
 
     codex "${args[@]}" "$(cat "$PROMPT_FILE")" >/dev/null 2>&1
